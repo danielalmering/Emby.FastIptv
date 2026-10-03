@@ -179,33 +179,11 @@ namespace Emby.FastIptv.LiveTv
             var headers = ParseCustomHeaders(GetTunerSettings(info.Id)?.CustomHeaders);
             var source = await BuildMediaSourceAsync(channelId, channel.Url, config, userAgent, headers, ct)
                 .ConfigureAwait(false);
-            var timeoutSeconds = GetEffectiveStreamTimeout(info.Id, config);
-            var retryCount = GetEffectiveStreamRetryCount(info.Id, config);
 
             if (GetTunerSettings(info.Id)?.EnableHealthProbe == true)
                 await ProbeStreamAsync(channel.Url, userAgent, headers, ct).ConfigureAwait(false);
 
-            Exception lastException = null;
-            for (var attempt = 0; attempt <= retryCount; attempt++)
-            {
-                if (attempt > 0)
-                    await Task.Delay(500, ct).ConfigureAwait(false);
-
-                var stream = new HttpLiveStream(channel.Url, source, info.Id, userAgent, headers, timeoutSeconds);
-                try
-                {
-                    await stream.Open(ct).ConfigureAwait(false);
-                    return stream;
-                }
-                catch (Exception ex)
-                {
-                    await stream.Close().ConfigureAwait(false);
-                    lastException = ex;
-                }
-            }
-
-            throw new InvalidOperationException(
-                $"Failed to open stream for '{channelId}' after {retryCount + 1} attempt(s).", lastException);
+            return new PassthroughLiveStream(source, info.Id);
         }
 
         // ── helpers ────────────────────────────────────────────────────────────
@@ -229,8 +207,11 @@ namespace Emby.FastIptv.LiveTv
                 Protocol = MediaProtocol.Http,
                 Container = container,
                 IsInfiniteStream = true,
-                RequiresOpening = false,
-                RequiresClosing = false,
+                // Required for recording: Emby's recorder only gets a live stream object when the
+                // source requires opening, and crashes without one. Opening is free — see
+                // PassthroughLiveStream — and the URL is still read directly by ffmpeg.
+                RequiresOpening = true,
+                RequiresClosing = true,
                 SupportsDirectPlay = true,
                 SupportsDirectStream = true,
                 SupportsTranscoding = true,
@@ -371,8 +352,8 @@ namespace Emby.FastIptv.LiveTv
             }
         }
 
-        // ffmpeg and direct-playing clients fetch the URL themselves rather than going
-        // through HttpLiveStream, so the tuner's User-Agent and custom headers have to
+        // ffmpeg, the recorder and direct-playing clients fetch the URL themselves (the live
+        // stream is a PassthroughLiveStream), so the tuner's User-Agent and custom headers have to
         // travel with the media source or the provider answers 403.
         private static Dictionary<string, string> BuildRequiredHeaders(
             string userAgent, Dictionary<string, string> customHeaders)
@@ -556,21 +537,6 @@ namespace Emby.FastIptv.LiveTv
 
             var global = Plugin.Instance?.Configuration?.CacheTtlHours ?? 6;
             return TimeSpan.FromHours(global > 0 ? global : 6);
-        }
-
-        private static int GetEffectiveStreamTimeout(string tunerId, PluginConfiguration config)
-        {
-            var perTuner = GetTunerSettings(tunerId)?.StreamTimeoutSeconds ?? 0;
-            if (perTuner > 0) return perTuner;
-            var global = config?.StreamTimeoutSeconds ?? 15;
-            return global > 0 ? global : 15;
-        }
-
-        private static int GetEffectiveStreamRetryCount(string tunerId, PluginConfiguration config)
-        {
-            var perTuner = GetTunerSettings(tunerId)?.StreamRetryCount ?? 0;
-            if (perTuner > 0) return perTuner;
-            return config?.StreamRetryCount ?? 2;
         }
 
         // Sends a HEAD request to verify the URL is reachable before committing to a full GET.

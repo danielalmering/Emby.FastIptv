@@ -19,7 +19,7 @@ Emby.FastIptv/
 │   ├── M3uParser.cs                   # Parses #EXTINF lines into M3uChannel
 │   ├── M3uChannel.cs                  # M3U channel model
 │   ├── XmlTvParser.cs                 # Parses XMLTV XML into ProgramInfo
-│   ├── HttpLiveStream.cs              # ILiveStream with custom UA + headers
+│   ├── PassthroughLiveStream.cs       # No-op ILiveStream so Emby's recorder works (see gotchas)
 │   └── Probe/                         # Fast in-process stream probe (see below)
 │       ├── StreamProber.cs            # HTTP read budget/deadline, HLS resolution, result cache
 │       ├── TsProbe.cs                 # MPEG-TS demux: PAT -> PMT -> per-PID elementary streams
@@ -89,10 +89,9 @@ Stored as `TunerSettings[]` array in `PluginConfiguration` (not a Dictionary —
 - Tuner setup UI: added XMLTV EPG URL field (null-guarded in JS)
 
 #### Phase 3 — Stream quality / reliability ✅ DONE (v1.0.2.1)
-- Retry logic on stream open failure: `StreamRetryCount` (global default 2, per-tuner override)
-- Per-tuner stream connection timeout: `StreamTimeoutSeconds` (global default 15 s, per-tuner override)
 - Stream health probe: `EnableHealthProbe` per tuner → HEAD request (5 s timeout) before opening stream
-- `HttpLiveStream` uses `Timeout.InfiniteTimeSpan` + linked CTS for per-request connect timeout
+- `StreamRetryCount` / `StreamTimeoutSeconds` drove the old `HttpLiveStream` open; since v1.0.4.0 the
+  live stream holds no connection, so these settings are stored but currently unused
 - Channel `group-title` mapped to `ChannelInfo.Tags` so channels appear grouped in the Emby UI
 
 #### Phase 4 — Fast stream probing ✅ DONE (v1.0.3.0)
@@ -227,14 +226,28 @@ refresh, at the price of one provider connection per channel — only sensible f
 - `XmlSerializer` cannot serialise `Dictionary<K,V>` — always use arrays for config collections
 - `ReadAsStringAsync()` in .NET 8 accepts a `CancellationToken`; in older frameworks it does not
 - `DateTimeOffset.ToUnixTimeSeconds()` is available in .NET 4.6+ / .NET Core
-- `MediaSourceInfo.RequiresOpening` is `false`, so Emby hands the URL straight to ffmpeg and
-  `HttpLiveStream` is bypassed on the normal playback path. Per-tuner User-Agent, custom headers,
-  stream timeout, retries and the health probe do **not** apply there — that is what
-  `RequiredHttpHeaders` on the media source is for
+- `MediaSourceInfo.RequiresOpening` must be `true`, or recording is impossible: `EmbyTV` only gets
+  an `ILiveStream` when the source requires opening, and `RecordingRequiresEncoding` /
+  `DirectRecorder.Record` read `liveStream.SupportsCopyTo` with no null check
+  (NullReferenceException; identical code in 4.9.5 and 4.10.1). `GetChannelStream` returns a
+  `PassthroughLiveStream`: `Open` is a no-op, `SupportsCopyTo` is false, and `Path` stays the
+  provider URL, so ffmpeg and the recorder fetch it themselves (direct HTTP copy for TS, ffmpeg for
+  HLS) and the plugin's probed `MediaStreams` are kept
+- Do **not** return Emby's own stream (`ILiveTvManager.CreateLiveStream` →
+  `SharedHttpPipelineSource`): its `Open` waits 3.5–8 s for a buffer and then always runs ffprobe,
+  which is exactly the built-in M3U tuner's slow start
+- Per-tuner User-Agent and custom headers reach ffmpeg and the recorder only through
+  `RequiredHttpHeaders` on the media source
+- Each `PassthroughLiveStream` gets a unique `MediaSource.Id` (Emby derives `LiveStreamId` from it);
+  streams are not shared, so a shared id would let one viewer's close hit another's stream
 - `MediaSourceInfo.SupportsProbing` / `AnalyzeDurationMs` / `ReadAtNativeFramerate` / `BufferMs` are
   `[Obsolete]` and `SupportsProbing` is not referenced by `Emby.LiveTV.dll` at all — setting them
   achieves nothing; Emby decides probing itself
-- `ILiveStream` on 4.8.8 and 4.9.5 has no `AddConsumer`/`RemoveConsumer` — don't add them speculatively
+- `ILiveStream` differs by version: 4.9.x has `int ConsumerCount { get; set; }`; 4.10 drops the setter
+  and adds `AddConsumer`/`RemoveConsumer`. The plugin implements all of them as **`virtual`** — the
+  CLR maps only virtual methods onto interface members, and a member missing from the compile-time
+  interface is otherwise emitted non-virtual and fails with TypeLoadException on the other version.
+  Verify by loading the built DLL against real 4.9.5.0 and 4.10.1.0 server assemblies, not just by compiling
 - `MediaStream.IsTextSubtitleStream` is read-only on 4.9.5 — assigning it does not compile
 - The probe parsers under `LiveTv/Probe/` deliberately reference no MediaBrowser type, so they can be
   compiled into a plain console harness and diffed against `ffprobe` without an Emby install
